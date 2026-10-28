@@ -1,5 +1,7 @@
 #include "cache.h"
 #include "heap.h"
+#include "objects.h"
+#include "var.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,12 +11,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-// Описатель переменной; плагин создаёт по одному на переменную в модуле
-struct ccs_var {
-  const char *name;
-  uint32_t slot;
-};
 
 namespace {
 
@@ -246,5 +242,8 @@ extern "C" void __ccs_access(void *addr, uint64_t size, uint32_t is_write,
                              ccs_var *var) {
   Runtime &rt = runtime();
   const uint64_t a = reinterpret_cast<uint64_t>(addr);
+  // Не видно при компиляции — ищем среди зарегистрированных объектов, затем в куче
+  if (!var)
+    var = find_object(a);
   rt.cache.access(a, size, is_write != 0, var ? rt.slot_for(var) : heap_slot(a));
 }

@@ -9,6 +9,8 @@ namespace ccs {
 // Номер переменной для адреса внутри живого блока кучи, 0 — адрес не из кучи
 uint32_t heap_slot(uint64_t addr);
 
+bool main_stack_contains(uint64_t addr);
+
 // Перевести стеки выделений в имена вида heap@файл:строка (заменяет names[слот])
 void heap_resolve_names(std::vector<std::string> &names);
 

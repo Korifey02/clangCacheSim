@@ -1,6 +1,7 @@
 #!/bin/sh
 # Использование: run_program_test.sh <каталог с ccs-clang> <файл.c>
-# Ожидания берутся из строк "// EXPECT: уровень переменная метрика значение",
+# Ожидания берутся из строк "// EXPECT: уровень переменная метрика значение"
+# (значение можно задать как "<=N" или ">=N"),
 # конфигурация кэша — из "// CCS_CACHE: ...".
 set -u
 bin=$1
@@ -28,7 +29,12 @@ while read -r level var key want; do
   got=$(awk -F'\t' -v l="$level" -v v="$var" -v k="$key" \
     '$1 == l && $2 == v && $3 == k { print $4 }' "$tmp/report.tsv")
   [ -n "$got" ] || got=0
-  if [ "$got" != "$want" ]; then
+  case "$want" in
+    "<="*) [ "$got" -le "${want#<=}" ] && ok=1 || ok=0 ;;
+    ">="*) [ "$got" -ge "${want#>=}" ] && ok=1 || ok=0 ;;
+    *) [ "$got" = "$want" ] && ok=1 || ok=0 ;;
+  esac
+  if [ "$ok" -ne 1 ]; then
     echo "FAIL $level $var $key: ожидалось $want, получено $got"
     failed=1
   fi

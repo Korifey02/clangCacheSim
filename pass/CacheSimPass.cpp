@@ -1,5 +1,7 @@
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
@@ -17,6 +19,7 @@
 #include "llvm/Passes/PassPlugin.h"
 #endif
 #include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 
@@ -39,12 +42,34 @@ private:
   PointerType *PtrTy;
   StructType *VarTy;
   FunctionCallee Hook;
+  FunctionCallee RegisterStack;
+  FunctionCallee RegisterGlobal;
   DenseMap<const Value *, Constant *> Vars;
+  // Место для регистраций при входе в функцию, запомненное до любых вставок
+  DenseMap<Function *, Instruction *> EntryPos;
 
   void instrument(Instruction *Before, Value *Ptr, Value *Size, bool IsWrite);
+  void registerAlloca(AllocaInst *AI);
+  void registerAllocaAt(AllocaInst *AI, Instruction *Before);
+  void registerGlobals();
   Constant *varFor(Value *Ptr);
   Constant *makeVar(StringRef Name);
 };
+
+// Адрес уходит за пределы функции: в вызов, в память, в возвращаемое значение
+bool escapes(const AllocaInst *AI) {
+#if LLVM_VERSION_MAJOR >= 21
+  return PointerMayBeCaptured(AI, /*ReturnCaptures=*/true);
+#else
+  return PointerMayBeCaptured(AI, /*ReturnCaptures=*/true, /*StoreCaptures=*/true);
+#endif
+}
+
+std::string globalName(const GlobalVariable *GV) {
+  if (GV->getName().starts_with(".str"))
+    return "<string literal>";
+  return demangle(GV->getName());
+}
 
 std::string localName(const DILocalVariable *V) {
   const DISubprogram *SP = V->getScope()->getSubprogram();
@@ -76,7 +101,7 @@ Instrumenter::Instrumenter(Module &M)
     : M(M), Ctx(M.getContext()), DL(M.getDataLayout()) {
   PtrTy = PointerType::getUnqual(Ctx);
   Type *I32 = Type::getInt32Ty(Ctx);
-  // Совпадает с struct ccs_var в runtime/runtime.cpp
+  // Совпадает с struct ccs_var в runtime/var.h
   VarTy = StructType::get(Ctx, {PtrTy, I32});
 
   // Рантайм не трогает память программы, поэтому вызов не мешает
@@ -88,16 +113,33 @@ Instrumenter::Instrumenter(Module &M)
   Hook = M.getOrInsertFunction(
       "__ccs_access", AttributeList::get(Ctx, AttributeList::FunctionIndex, AB),
       Type::getVoidTy(Ctx), PtrTy, Type::getInt64Ty(Ctx), I32, PtrTy);
+
+  AttrBuilder NoUnwind(Ctx);
+  NoUnwind.addAttribute(Attribute::NoUnwind);
+  AttributeList RegAttrs =
+      AttributeList::get(Ctx, AttributeList::FunctionIndex, NoUnwind);
+  RegisterStack = M.getOrInsertFunction("__ccs_register_stack", RegAttrs,
+                                        Type::getVoidTy(Ctx), PtrTy,
+                                        Type::getInt64Ty(Ctx), PtrTy);
+  RegisterGlobal = M.getOrInsertFunction("__ccs_register_global", RegAttrs,
+                                         Type::getVoidTy(Ctx), PtrTy,
+                                         Type::getInt64Ty(Ctx), PtrTy);
 }
 
 bool Instrumenter::run() {
   SmallVector<Instruction *, 128> Work;
+  // Анализ убегания — до вставки вызовов, иначе они сами будут считаться захватом
+  SmallVector<AllocaInst *, 16> Escaping;
   for (Function &F : M) {
     if (F.isDeclaration() || F.getName().starts_with("__ccs_"))
       continue;
-    for (Instruction &I : instructions(F))
+    EntryPos[&F] = &*F.getEntryBlock().getFirstNonPHIOrDbgOrAlloca();
+    for (Instruction &I : instructions(F)) {
       if (isa<LoadInst, StoreInst, MemTransferInst, MemSetInst>(&I))
         Work.push_back(&I);
+      else if (auto *AI = dyn_cast<AllocaInst>(&I); AI && escapes(AI))
+        Escaping.push_back(AI);
+    }
   }
 
   for (Instruction *I : Work) {
@@ -118,7 +160,76 @@ bool Instrumenter::run() {
       instrument(I, MS->getRawDest(), MS->getLength(), true);
     }
   }
-  return !Work.empty();
+
+  for (AllocaInst *AI : Escaping)
+    registerAlloca(AI);
+  registerGlobals();
+  return true;
+}
+
+// К объекту на стеке могут обратиться через указатель, где переменную уже
+// не видно статически: сообщаем рантайму его адрес и размер, когда объект
+// начинает жить. Объекты с непересекающимся временем жизни компилятор кладёт
+// на одно место стека, поэтому регистрация при входе в функцию не годится:
+// выиграл бы тот, кого зарегистрировали последним
+void Instrumenter::registerAlloca(AllocaInst *AI) {
+  SmallVector<Instruction *, 4> Starts;
+  for (User *U : AI->users())
+    if (auto *II = dyn_cast<IntrinsicInst>(U);
+        II && II->getIntrinsicID() == Intrinsic::lifetime_start)
+      Starts.push_back(II);
+
+  if (!Starts.empty()) {
+    for (Instruction *S : Starts)
+      registerAllocaAt(AI, S->getNextNode());
+  } else if (AI->isStaticAlloca()) {
+    registerAllocaAt(AI, EntryPos.lookup(AI->getFunction()));
+  } else {
+    registerAllocaAt(AI, AI->getNextNode());
+  }
+}
+
+void Instrumenter::registerAllocaAt(AllocaInst *AI, Instruction *Before) {
+  IRBuilder<> B(Before);
+
+  Value *Size;
+  std::optional<TypeSize> TS = AI->getAllocationSize(DL);
+  if (TS && !TS->isScalable()) {
+    Size = B.getInt64(TS->getFixedValue());
+  } else {
+    // Массив переменной длины: число элементов известно только при выполнении
+    Value *Count = B.CreateZExtOrTrunc(AI->getArraySize(), B.getInt64Ty());
+    Size = B.CreateMul(
+        Count, B.getInt64(DL.getTypeAllocSize(AI->getAllocatedType())));
+  }
+  B.CreateCall(RegisterStack, {AI, Size, varFor(AI)});
+}
+
+void Instrumenter::registerGlobals() {
+  SmallVector<GlobalVariable *, 32> Globals;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.isDeclaration() || GV.isThreadLocal() ||
+        GV.getAddressSpace() != 0 || GV.hasAvailableExternallyLinkage() ||
+        GV.getName().starts_with("llvm.") || GV.getName().starts_with("__ccs_"))
+      continue;
+    if (GV.getValueType()->isSized() &&
+        DL.getTypeAllocSize(GV.getValueType()) > 0)
+      Globals.push_back(&GV);
+  }
+  if (Globals.empty())
+    return;
+
+  Function *Ctor = Function::Create(
+      FunctionType::get(Type::getVoidTy(Ctx), false),
+      GlobalValue::InternalLinkage, "__ccs_register_globals", M);
+  IRBuilder<> B(BasicBlock::Create(Ctx, "", Ctor));
+  for (GlobalVariable *GV : Globals)
+    B.CreateCall(RegisterGlobal,
+                 {GV, B.getInt64(DL.getTypeAllocSize(GV->getValueType())),
+                  varFor(GV)});
+  B.CreateRetVoid();
+  // Раньше пользовательских конструкторов: те уже могут обращаться к глобальным
+  appendToGlobalCtors(M, Ctor, 1);
 }
 
 void Instrumenter::instrument(Instruction *Before, Value *Ptr, Value *Size,
@@ -143,7 +254,7 @@ Constant *Instrumenter::varFor(Value *Ptr) {
   Constant *Var = nullptr;
   if (auto *GV = dyn_cast<GlobalVariable>(Obj)) {
     if (!GV->getName().starts_with("__ccs_"))
-      Var = makeVar(demangle(GV->getName()));
+      Var = makeVar(globalName(GV));
   } else if (auto *AI = dyn_cast<AllocaInst>(Obj)) {
     Var = makeVar(allocaName(const_cast<AllocaInst *>(AI)));
   }

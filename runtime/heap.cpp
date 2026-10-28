@@ -1,6 +1,7 @@
 #include "heap.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <new>
 #include <pthread.h>
 #include <set>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -30,6 +32,84 @@ void *__libc_pvalloc(size_t);
 }
 
 namespace {
+
+// Своя память рантайма. Если брать её из общей кучи, служебные узлы встают
+// между блоками программы и меняют её раскладку, а значит и промахи кэша.
+// Блоки размером 2^k с заголовком, освобождённые — в списки по размеру.
+class Arena {
+public:
+  bool owns(const void *p) const {
+    return reinterpret_cast<uintptr_t>(p) - base_ < size_;
+  }
+
+  void *alloc(size_t n) {
+    unsigned cls = 5;
+    while ((size_t(1) << cls) < n + kHeader)
+      ++cls;
+    const size_t bytes = size_t(1) << cls;
+    lock();
+    if (!base_)
+      init();
+    void *chunk = free_[cls];
+    if (chunk) {
+      free_[cls] = *static_cast<void **>(chunk);
+    } else if (base_ && next_ + bytes <= base_ + size_) {
+      chunk = reinterpret_cast<void *>(next_);
+      next_ += bytes;
+    }
+    unlock();
+    if (!chunk)
+      return nullptr;
+    *static_cast<uint32_t *>(chunk) = cls;
+    return static_cast<char *>(chunk) + kHeader;
+  }
+
+  void free(void *p) {
+    void *chunk = static_cast<char *>(p) - kHeader;
+    const uint32_t cls = *static_cast<uint32_t *>(chunk);
+    lock();
+    *static_cast<void **>(chunk) = free_[cls];
+    free_[cls] = chunk;
+    unlock();
+  }
+
+  size_t usable(const void *p) const {
+    const uint32_t cls =
+        *reinterpret_cast<const uint32_t *>(static_cast<const char *>(p) - kHeader);
+    return (size_t(1) << cls) - kHeader;
+  }
+
+private:
+  static constexpr size_t kHeader = 16;
+
+  void init() {
+    // Резервируется только адресное пространство, страницы выделяются при касании
+    for (size_t reserve = size_t(64) << 30; reserve >= (size_t(1) << 30);
+         reserve /= 4) {
+      void *p = mmap(nullptr, reserve, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      if (p != MAP_FAILED) {
+        base_ = next_ = reinterpret_cast<uintptr_t>(p);
+        size_ = reserve;
+        return;
+      }
+    }
+  }
+
+  void lock() {
+    while (lock_.test_and_set(std::memory_order_acquire)) {
+    }
+  }
+  void unlock() { lock_.clear(std::memory_order_release); }
+
+  uintptr_t base_ = 0;
+  uintptr_t size_ = 0;
+  uintptr_t next_ = 0;
+  void *free_[64] = {};
+  std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+};
+
+Arena g_arena;
 
 constexpr int kMaxFrames = 12;
 
@@ -282,6 +362,11 @@ namespace ccs {
 HeapPause::HeapPause() : prev(t_busy) { t_busy = true; }
 HeapPause::~HeapPause() { t_busy = prev; }
 
+bool main_stack_contains(uint64_t addr) {
+  const Heap *h = g_heap;
+  return h && addr - h->stack_lo < h->stack_hi - h->stack_lo;
+}
+
 // Без блокировки: рантайм пока рассчитан на однопоточные программы (ROADMAP 5.0)
 uint32_t heap_slot(uint64_t addr) {
   Heap *h = g_heap;
@@ -289,7 +374,7 @@ uint32_t heap_slot(uint64_t addr) {
     return 0;
   if (addr - h->last_begin < h->last_size)
     return h->last_slot;
-  if (addr - h->stack_lo < h->stack_hi - h->stack_lo)
+  if (main_stack_contains(addr))
     return 0;
   auto it = h->blocks.upper_bound(addr);
   if (it == h->blocks.begin())
@@ -423,34 +508,72 @@ void heap_print_sites_tsv(FILE *f, const std::vector<std::string> &names) {
 
 } // namespace ccs
 
+namespace {
+
+void *realloc_impl(void *old, size_t n, void *ra) {
+  if (g_arena.owns(old)) {
+    void *p = t_busy ? g_arena.alloc(n) : nullptr;
+    if (!p)
+      p = __libc_malloc(n);
+    if (p)
+      std::memcpy(p, old, std::min(n, g_arena.usable(old)));
+    g_arena.free(old);
+    return p;
+  }
+  if (t_busy && !old)
+    if (void *p = g_arena.alloc(n))
+      return p;
+  void *p = __libc_realloc(old, n);
+  // При неудаче старый блок остаётся живым
+  if (p || n == 0)
+    on_free(old);
+  on_alloc(p, n, ra);
+  return p;
+}
+
+} // namespace
+
 // Подмена распределителя памяти. glibc явно поддерживает такую замену:
-// достаточно определить эти функции в программе.
+// достаточно определить эти функции в программе. Выделения самого рантайма
+// (t_busy) идут в его собственную область g_arena.
 extern "C" {
 
 void *malloc(size_t n) noexcept {
+  if (t_busy)
+    if (void *p = g_arena.alloc(n))
+      return p;
   void *p = __libc_malloc(n);
   on_alloc(p, n, __builtin_return_address(0));
   return p;
 }
 
 void free(void *p) noexcept {
+  if (g_arena.owns(p)) {
+    g_arena.free(p);
+    return;
+  }
   on_free(p);
   __libc_free(p);
 }
 
 void *calloc(size_t count, size_t n) noexcept {
+  size_t total;
+  if (__builtin_mul_overflow(count, n, &total)) {
+    errno = ENOMEM;
+    return nullptr;
+  }
+  if (t_busy)
+    if (void *p = g_arena.alloc(total)) {
+      std::memset(p, 0, total);
+      return p;
+    }
   void *p = __libc_calloc(count, n);
-  on_alloc(p, count * n, __builtin_return_address(0));
+  on_alloc(p, total, __builtin_return_address(0));
   return p;
 }
 
 void *realloc(void *old, size_t n) noexcept {
-  void *p = __libc_realloc(old, n);
-  // При неудаче старый блок остаётся живым
-  if (p || n == 0)
-    on_free(old);
-  on_alloc(p, n, __builtin_return_address(0));
-  return p;
+  return realloc_impl(old, n, __builtin_return_address(0));
 }
 
 void *reallocarray(void *old, size_t count, size_t n) noexcept {
@@ -459,11 +582,15 @@ void *reallocarray(void *old, size_t count, size_t n) noexcept {
     errno = ENOMEM;
     return nullptr;
   }
-  void *p = __libc_realloc(old, total);
-  if (p || total == 0)
-    on_free(old);
-  on_alloc(p, total, __builtin_return_address(0));
-  return p;
+  return realloc_impl(old, total, __builtin_return_address(0));
+}
+
+size_t malloc_usable_size(void *p) noexcept {
+  if (g_arena.owns(p))
+    return g_arena.usable(p);
+  using Fn = size_t (*)(void *);
+  static Fn libc = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "malloc_usable_size"));
+  return libc ? libc(p) : 0;
 }
 
 void *memalign(size_t align, size_t n) noexcept {

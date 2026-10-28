@@ -28,7 +28,7 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(CacheSimPass PRIVATE -fno-rtti)
 endif()
 
-add_library(ccs_rt STATIC runtime/cache.cpp runtime/heap.cpp runtime/runtime.cpp)
+add_library(ccs_rt STATIC runtime/cache.cpp runtime/heap.cpp runtime/objects.cpp runtime/runtime.cpp)
 set_target_properties(ccs_rt PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Им рантайм при выходе превращает адреса мест выделения в файл:строку
 target_compile_definitions(ccs_rt PRIVATE CCS_SYMBOLIZER="${LLVM_TOOLS_BINARY_DIR}/llvm-symbolizer")
