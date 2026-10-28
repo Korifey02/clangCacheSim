@@ -1,0 +1,22 @@
+#!/bin/sh
+if [ $# -lt 1 ]; then
+  echo "usage: ccs-run <file.c|file.cpp> [clang flags...]" >&2
+  exit 1
+fi
+
+src=$1
+shift
+# Пути вида C:\... приходят при запуске из Windows через wsl
+case "$src" in
+  [A-Za-z]:\\*|[A-Za-z]:/*) src=$(wslpath -u "$src") ;;
+esac
+
+case "$src" in
+  *.c) cc="@CCS_BIN_DIR@/ccs-clang" ;;
+  *) cc="@CCS_BIN_DIR@/ccs-clang++" ;;
+esac
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+"$cc" -O2 "$@" "$src" -o "$tmp/prog" || exit 1
+"$tmp/prog"

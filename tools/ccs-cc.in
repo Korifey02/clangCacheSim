@@ -1,0 +1,13 @@
+#!/bin/sh
+link=1
+for arg in "$@"; do
+  case "$arg" in
+    -c|-S|-E|-M|-MM|-fsyntax-only) link=0 ;;
+  esac
+done
+
+if [ "$link" -eq 1 ]; then
+  exec "@CCS_COMPILER@" -g -fplugin="@CCS_PLUGIN@" -fpass-plugin="@CCS_PLUGIN@" "$@" "@CCS_RUNTIME@" -lstdc++ -lm
+else
+  exec "@CCS_COMPILER@" -g -fplugin="@CCS_PLUGIN@" -fpass-plugin="@CCS_PLUGIN@" "$@"
+fi
