@@ -28,8 +28,10 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(CacheSimPass PRIVATE -fno-rtti)
 endif()
 
-add_library(ccs_rt STATIC runtime/cache.cpp runtime/runtime.cpp)
+add_library(ccs_rt STATIC runtime/cache.cpp runtime/heap.cpp runtime/runtime.cpp)
 set_target_properties(ccs_rt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Им рантайм при выходе превращает адреса мест выделения в файл:строку
+target_compile_definitions(ccs_rt PRIVATE CCS_SYMBOLIZER="${LLVM_TOOLS_BINARY_DIR}/llvm-symbolizer")
 
 # build/bin/ccs-clang и ccs-clang++ — clang с подключённым плагином и рантаймом
 set(CCS_PLUGIN $<TARGET_FILE:CacheSimPass>)
@@ -54,7 +56,8 @@ add_executable(cache_test tests/unit/cache_test.cpp runtime/cache.cpp)
 target_include_directories(cache_test PRIVATE runtime)
 add_test(NAME unit/cache COMMAND cache_test)
 
-file(GLOB CCS_PROGRAM_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tests/programs/*.c)
+file(GLOB CCS_PROGRAM_TESTS CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/tests/programs/*.c ${CMAKE_SOURCE_DIR}/tests/programs/*.cpp)
 foreach(src ${CCS_PROGRAM_TESTS})
   get_filename_component(name ${src} NAME_WE)
   add_test(NAME program/${name}

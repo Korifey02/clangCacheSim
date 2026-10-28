@@ -10,7 +10,11 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 cache=$(sed -n 's|^// CCS_CACHE: *||p' "$src")
-"$bin/ccs-clang" -O2 "$src" -o "$tmp/prog" || exit 1
+case "$src" in
+  *.c) cc="$bin/ccs-clang" ;;
+  *) cc="$bin/ccs-clang++" ;;
+esac
+"$cc" -O2 "$src" -o "$tmp/prog" || exit 1
 CCS_FORMAT=tsv CCS_REPORT="$tmp/report.tsv" CCS_CACHE="$cache" "$tmp/prog" >/dev/null
 
 sed -n 's|^// EXPECT: *||p' "$src" >"$tmp/expect"

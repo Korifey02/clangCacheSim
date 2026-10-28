@@ -1,4 +1,5 @@
 #include "cache.h"
+#include "heap.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,7 @@ using namespace ccs;
 using Clock = std::chrono::steady_clock;
 
 const char *kDefaultConfig = "L1:32768:64:8,L2:262144:64:8";
+constexpr size_t kNameWidth = 60;
 
 std::vector<LevelConfig> parse_config(const char *s) {
   std::vector<LevelConfig> out;
@@ -59,6 +61,7 @@ struct Runtime {
   uint32_t slot_for(ccs_var *v) {
     if (v->slot)
       return v->slot;
+    HeapPause pause;
     auto [it, inserted] = slot_by_name.try_emplace(v->name, names.size());
     if (inserted) {
       names.push_back(v->name);
@@ -66,6 +69,26 @@ struct Runtime {
     }
     v->slot = it->second;
     return v->slot;
+  }
+
+  uint32_t add_slot(const std::string &name) {
+    names.push_back(name);
+    cache.resize_vars(names.size());
+    return names.size() - 1;
+  }
+
+  // Разные стеки выделения могут дать одно место в коде — складываем их счётчики
+  void merge_same_names() {
+    std::unordered_map<std::string, uint32_t> first;
+    for (uint32_t i = 0; i < names.size(); ++i) {
+      auto [it, inserted] = first.try_emplace(names[i], i);
+      if (inserted)
+        continue;
+      for (CacheLevel &l : cache.levels) {
+        l.per_var[it->second] += l.per_var[i];
+        l.per_var[i] = Counters{};
+      }
+    }
   }
 };
 
@@ -104,12 +127,14 @@ void print_level(FILE *f, const Runtime &rt, const CacheLevel &l) {
   size_t width = 8;
   for (uint32_t i : order)
     width = std::max(width, rt.names[i].size());
+  width = std::min(width, kNameWidth);
   std::fprintf(f, "  %-*s %12s %12s %12s %12s %9s\n", int(width), "variable",
                "accesses", "misses", "read miss", "write miss", "miss rate");
   for (uint32_t i : order) {
     const Counters &c = l.per_var[i];
     std::fprintf(f, "  %-*s %12llu %12llu %12llu %12llu %8.3f%%\n", int(width),
-                 rt.names[i].c_str(), (unsigned long long)c.accesses(),
+                 shorten(rt.names[i], width).c_str(),
+                 (unsigned long long)c.accesses(),
                  (unsigned long long)c.misses(),
                  (unsigned long long)c.read_misses,
                  (unsigned long long)c.write_misses,
@@ -122,7 +147,9 @@ void tsv_counters(FILE *f, const char *level, const char *var,
                   const Counters &c) {
   const std::pair<const char *, uint64_t> rows[] = {
       {"accesses", c.accesses()},       {"hits", c.hits()},
-      {"misses", c.misses()},           {"read_hits", c.read_hits},
+      {"misses", c.misses()},           {"reads", c.read_hits + c.read_misses},
+      {"writes", c.write_hits + c.write_misses},
+      {"read_hits", c.read_hits},
       {"write_hits", c.write_hits},     {"read_misses", c.read_misses},
       {"write_misses", c.write_misses},
   };
@@ -146,14 +173,18 @@ void report_tsv(FILE *f, const Runtime &rt, uint64_t writes_during_run) {
   std::fprintf(f, "mem\t-\twrites\t%llu\n", (unsigned long long)rt.cache.mem_writes);
   std::fprintf(f, "mem\t-\twrites_flush\t%llu\n",
                (unsigned long long)(rt.cache.mem_writes - writes_during_run));
+  heap_print_sites_tsv(f, rt.names);
 }
 
 void report() {
+  HeapPause pause;
   Runtime &rt = *g_rt;
   const double seconds =
       std::chrono::duration<double>(Clock::now() - rt.start).count();
   const uint64_t writes_during_run = rt.cache.mem_writes;
   rt.cache.flush();
+  heap_resolve_names(rt.names);
+  rt.merge_same_names();
 
   FILE *f = stderr;
   const char *path = std::getenv("CCS_REPORT");
@@ -176,6 +207,7 @@ void report() {
   std::fprintf(f, "\n=== clangCacheSim ===\nTime %.4f s\n\n", seconds);
   for (const CacheLevel &l : rt.cache.levels)
     print_level(f, rt, l);
+  heap_print_sites(f, rt.names);
   std::fprintf(f, "Memory reads   %llu\n", (unsigned long long)rt.cache.mem_reads);
   std::fprintf(f, "Memory writes  %llu (during run %llu, final flush %llu)\n",
                (unsigned long long)rt.cache.mem_writes,
@@ -187,6 +219,7 @@ void report() {
 
 Runtime &runtime() {
   if (!g_rt) {
+    HeapPause pause;
     const char *cfg = std::getenv("CCS_CACHE");
     g_rt = new Runtime(parse_config(cfg && *cfg ? cfg : kDefaultConfig));
     std::atexit(report);
@@ -196,9 +229,22 @@ Runtime &runtime() {
 
 } // namespace
 
+std::string ccs::shorten(const std::string &name, size_t max) {
+  if (name.size() <= max || max < 8)
+    return name;
+  const size_t head = (max - 3) / 2;
+  const size_t tail = max - 3 - head;
+  return name.substr(0, head) + "..." + name.substr(name.size() - tail);
+}
+
+uint32_t ccs::new_slot(const std::string &name) {
+  HeapPause pause;
+  return runtime().add_slot(name);
+}
+
 extern "C" void __ccs_access(void *addr, uint64_t size, uint32_t is_write,
                              ccs_var *var) {
   Runtime &rt = runtime();
-  rt.cache.access(reinterpret_cast<uint64_t>(addr), size, is_write != 0,
-                  var ? rt.slot_for(var) : 0);
+  const uint64_t a = reinterpret_cast<uint64_t>(addr);
+  rt.cache.access(a, size, is_write != 0, var ? rt.slot_for(var) : heap_slot(a));
 }

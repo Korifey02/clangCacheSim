@@ -18,6 +18,14 @@ struct Counters {
   uint64_t read_misses = 0;
   uint64_t write_misses = 0;
 
+  Counters &operator+=(const Counters &o) {
+    read_hits += o.read_hits;
+    write_hits += o.write_hits;
+    read_misses += o.read_misses;
+    write_misses += o.write_misses;
+    return *this;
+  }
+
   uint64_t hits() const { return read_hits + write_hits; }
   uint64_t misses() const { return read_misses + write_misses; }
   uint64_t accesses() const { return hits() + misses(); }
