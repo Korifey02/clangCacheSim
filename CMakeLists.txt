@@ -8,10 +8,15 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CCS_LLVM_VERSION 23 CACHE STRING "Мажорная версия LLVM, под которую собирается плагин")
+if(NOT LLVM_DIR)
+  set(LLVM_DIR /usr/lib/llvm-${CCS_LLVM_VERSION}/lib/cmake/llvm)
+endif()
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "LLVM ${LLVM_PACKAGE_VERSION}: ${LLVM_DIR}")
-if(NOT LLVM_VERSION_MAJOR EQUAL 20)
-  message(FATAL_ERROR "Нужен LLVM 20, найден ${LLVM_PACKAGE_VERSION}. Укажите -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm")
+if(NOT LLVM_VERSION_MAJOR EQUAL CCS_LLVM_VERSION)
+  message(FATAL_ERROR "Нужен LLVM ${CCS_LLVM_VERSION}, найден ${LLVM_PACKAGE_VERSION} (${LLVM_DIR}). "
+                      "Пересоздайте каталог сборки или укажите -DLLVM_DIR=/usr/lib/llvm-${CCS_LLVM_VERSION}/lib/cmake/llvm")
 endif()
 
 # Плагин грузится внутрь clang, поэтому собирается с теми же флагами, что и LLVM

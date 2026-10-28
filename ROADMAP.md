@@ -1,7 +1,7 @@
 # clangCacheSim Roadmap
 
 ## Этап A — Прототип
-+ A.1 clang 20 / LLVM 20 в WSL, сборка плагина через CMake
++ A.1 clang / LLVM 23 (apt.llvm.org) в WSL, сборка плагина через CMake; версия LLVM — параметр CCS_LLVM_VERSION
 + A.2 Проход: вызов __ccs_access перед load/store/memcpy/memset
 + A.3 Статическая привязка к глобальным и локальным переменным (имя символа, отладочная информация)
 + A.4 Режимы early (обращения исходника) и late (обращения машинного кода)

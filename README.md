@@ -6,12 +6,21 @@
 
 ## Сборка
 
-Нужны clang-20, llvm-20-dev, cmake, ninja.
+Нужны clang-23, llvm-23-dev, cmake, ninja. Для Ubuntu 24.04 пакеты берутся из apt.llvm.org:
 
 ```sh
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++-20 -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+sudo curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /etc/apt/keyrings/apt.llvm.org.asc
+echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" \
+  | sudo tee /etc/apt/sources.list.d/llvm-23.list
+sudo apt update && sudo apt install clang-23 lld-23 llvm-23-dev cmake ninja-build
+```
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++-23
 ninja -C build
 ```
+
+Другая версия LLVM — `-DCCS_LLVM_VERSION=20` (и `clang++-20`).
 
 ## Использование
 

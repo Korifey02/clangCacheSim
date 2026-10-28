@@ -9,8 +9,13 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
+// С LLVM 23 заголовок плагинов переехал в отдельную библиотеку Plugins
+#if __has_include("llvm/Plugins/PassPlugin.h")
+#include "llvm/Plugins/PassPlugin.h"
+#else
+#include "llvm/Passes/PassPlugin.h"
+#endif
 #include "llvm/Transforms/Scalar/SROA.h"
 
 using namespace llvm;
@@ -51,13 +56,9 @@ std::string localName(const DILocalVariable *V) {
 std::string allocaName(AllocaInst *AI) {
   for (DbgVariableRecord *R : findDVRDeclares(AI))
     return localName(R->getVariable());
-  for (DbgDeclareInst *D : findDbgDeclares(AI))
-    return localName(D->getVariable());
   // С оптимизациями и -g clang вместо dbg_declare ставит dbg_assign
   for (DbgVariableRecord *R : at::getDVRAssignmentMarkers(AI))
     return localName(R->getVariable());
-  for (DbgAssignIntrinsic *D : at::getAssignmentMarkers(AI))
-    return localName(D->getVariable());
   std::string Fn = demangle(AI->getFunction()->getName());
   if (AI->hasName())
     return Fn + "::" + AI->getName().str();

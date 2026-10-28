@@ -6,6 +6,8 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CACHESIM_EXE=${CACHESIM_EXE:-/mnt/c/Users/ikori/repositories_eduction/CacheSim/CacheSim.exe}
+# Нативная сборка тем же clang, что и в ccs-clang
+NATIVE_CC=${NATIVE_CC:-$(sed -n 's|^ *exec "\([^"]*\)".*|\1|p' "$ROOT/build/bin/ccs-clang" | head -1)}
 
 verbose=0
 if [ "${1:-}" = "-v" ]; then
@@ -54,7 +56,7 @@ for src in "$@"; do
   new_acc=$(first_num '^  accesses' "$tmp/new.txt")
   new_miss=$(first_num '^  misses' "$tmp/new.txt")
 
-  clang-20 -O2 "$src" -o "$tmp/native" || exit 1
+  "$NATIVE_CC" -O2 "$src" -o "$tmp/native" || exit 1
   s=$(now)
   "$tmp/native" >/dev/null
   e=$(now)
